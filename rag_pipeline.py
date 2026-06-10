@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from typing import Optional
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
@@ -15,10 +14,12 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
 )
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
 
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
@@ -39,9 +40,7 @@ Answer:""",
 # ── Document loading ───────────────────────────────────────────────────────────
 
 def load_document(uploaded_file) -> list:
-    """Load a Streamlit UploadedFile into LangChain Documents."""
     suffix = os.path.splitext(uploaded_file.name)[-1].lower()
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
@@ -81,9 +80,9 @@ def build_vectorstore(chunks: list) -> FAISS:
     return FAISS.from_documents(chunks, embeddings)
 
 
-# ── QA Chain ───────────────────────────────────────────────────────────────────
+# ── QA Chain (LCEL — no deprecated chains) ────────────────────────────────────
 
-def build_qa_chain(vectorstore: FAISS, groq_api_key: str, k: int = 4) -> RetrievalQA:
+def build_qa_chain(vectorstore: FAISS, groq_api_key: str, k: int = 4):
     llm = ChatGroq(
         api_key=groq_api_key,
         model="llama-3.3-70b-versatile",
@@ -91,47 +90,53 @@ def build_qa_chain(vectorstore: FAISS, groq_api_key: str, k: int = 4) -> Retriev
         max_tokens=1024,
     )
     retriever = vectorstore.as_retriever(search_kwargs={"k": k})
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=retriever,
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": RAG_PROMPT},
-        return_source_documents=True,
+
+    def format_docs(docs):
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    chain = (
+        {
+            "context": retriever | format_docs,
+            "question": RunnablePassthrough(),
+        }
+        | RAG_PROMPT
+        | llm
+        | StrOutputParser()
     )
+    return {"chain": chain, "retriever": retriever}
 
 
 # ── Full pipeline ──────────────────────────────────────────────────────────────
 
 def process_document(uploaded_file, groq_api_key: str) -> dict:
-    """
-    End-to-end: load → chunk → embed → index.
-    Returns a dict with qa_chain + metadata.
-    """
     docs = load_document(uploaded_file)
     chunks = split_documents(docs)
     vectorstore = build_vectorstore(chunks)
-    qa_chain = build_qa_chain(vectorstore, groq_api_key)
+    qa = build_qa_chain(vectorstore, groq_api_key)
 
     return {
-        "qa_chain": qa_chain,
-        "vectorstore": vectorstore,
+        "chain": qa["chain"],
+        "retriever": qa["retriever"],
         "num_pages": len(docs),
         "num_chunks": len(chunks),
         "file_name": uploaded_file.name,
     }
 
 
-def query_document(qa_chain: RetrievalQA, question: str) -> dict:
-    """Run a question through the RAG chain."""
-    result = qa_chain.invoke({"query": question})
+def query_document(pipeline: dict, question: str) -> dict:
+    chain = pipeline["chain"]
+    retriever = pipeline["retriever"]
+
+    # Get answer
+    answer = chain.invoke(question)
+
+    # Get source docs separately
+    source_docs = retriever.invoke(question)
     sources = [
         {
             "page": doc.metadata.get("page", "?"),
             "snippet": doc.page_content[:200],
         }
-        for doc in result.get("source_documents", [])
+        for doc in source_docs
     ]
-    return {
-        "answer": result["result"],
-        "sources": sources,
-    }
+    return {"answer": answer, "sources": sources}
